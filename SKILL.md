@@ -1,24 +1,51 @@
 ---
 name: finance-ledger
-description: "Use when logging personal-finance ledger entries, reporting the budget sheet, or rolling a month over. Deterministic local-first Markdown ledger: Need/Want classification, local-timezone dating, a 50/30/20 budget view, and complete-sheet output."
-version: 1.0.0
+description: "Use when logging personal-finance ledger entries, reporting the budget sheet, or rolling a month over. Deterministic local-first Markdown ledger: Need/Want classification, local-timezone dating, a budget view built from the user's own Needs/Wants/Savings split, and complete-sheet output."
+version: 1.1.0
 license: MIT
 metadata:
   hermes:
-    tags: [finance, ledger, budget, need-want, 50-30-20, rollover, markdown, local-first]
+    tags: [finance, ledger, budget, need-want, budget-split, rollover, markdown, local-first]
 ---
 
 # Finance ledger
 
 A deterministic personal-finance ledger that lives in one Markdown file the user
 owns. The user sends entries in chat; the tool parses them, classifies each as a
-Need or a Want, dates them in the user's local timezone, keeps the 50/30/20
-budget view and the monthly rollover consistent, and prints the **complete**
-updated sheet.
+Need or a Want, dates them in the user's local timezone, keeps the budget view
+(built from the user's own Needs/Wants/Savings split) and the monthly rollover
+consistent, and prints the **complete** updated sheet.
 
 The default storage backend is a local file: no account, no credentials, no
 network. Standard library only. Optional cloud storage is a separate, opt-in
 adapter (see *Storage backends*).
+
+## First run: ask for the split, never assume one
+
+The budget maximums come from the user's **own** Needs/Wants/Savings split, and
+there is no default. Before logging anything on a ledger, ASK the user for their
+three percentages and set them with `config`:
+
+```bash
+python3 scripts/finance_logger.py config --ledger ledger.md \
+  --needs 60 --wants 25 --savings 15 --apply
+```
+
+The three values are whole numbers from 0 to 100 that must add up to exactly 100.
+Needs are the essentials the month cannot avoid (rent, food, transport, bills,
+medicine); Wants are discretionary (takeout, subscriptions, treats, games);
+Savings is what is set aside. `config --help` states the same split of meanings.
+
+The split is written into the sheet's own budget heading (`60/25/15`), so the file
+carries its configuration and nothing sits beside it to drift. Until a ledger has
+one, `add`, `rollover` and every other command that computes a budget maximum
+refuses to run and points at `config`. That refusal is correct behaviour, not a
+fault: report it, ask the user for their split, and never assume 50/30/20, which
+is somebody else's budget.
+
+Changing the split later is the same command. The maximums and the remaining
+figures are recomputed from the new percentages; entries already logged are not
+reclassified, so the ledger's history keeps the Need/Want labels it was given.
 
 ## Output contract
 
@@ -47,7 +74,7 @@ In:
 MM/DD/YY - <amount>
 Total: <sum>
 
-50/30/20
+<needs>/<wants>/<savings>     # the user's split; `Needs/Wants/Savings` until config
 Needs - <max> Max
 Wants - <max> Max
 
@@ -77,7 +104,8 @@ Total: <n>
 ```
 
 Invariants the tool maintains: `Loans` total equals the sum of its balances, the
-50/30/20 lines are 50/30/20 % of total income, `Savings` remaining subtracts
+budget maximums are the sheet's own split (its budget heading, for example
+`60/25/15`) applied to total income, `Savings` remaining subtracts
 `Total`, `Borrowed` and `Used for loans`, `Remaining` per bucket is its maximum
 minus its spend, `Remaining` total is the sum of the three buckets, and
 `Confirmed cash remaining` is income minus posted expenses minus cash-funded debt
@@ -90,6 +118,10 @@ The ledger path comes from `--ledger`, else `$FINANCE_LEDGER_PATH`, else
 sheet; `--apply` is the only switch that writes.
 
 ```bash
+# Set the user's own split first; every maximum is computed from it.
+python3 scripts/finance_logger.py config --ledger ledger.md \
+  --needs 60 --wants 25 --savings 15 --apply
+
 # Log a batch (repeat --entry). Default date is today in the local timezone.
 python3 scripts/finance_logger.py add --ledger ledger.md \
   --entry '42 groceries' --entry '85 streaming subscription' --date 2026-09-12
@@ -113,11 +145,16 @@ python3 scripts/finance_logger.py rollover --ledger ledger.md \
 
 Add `--kind need|want` to override the classifier for a whole batch, `--month` to
 state the sheet month explicitly, `--event-id` for replay protection, and
-`--timezone` to date undated entries outside the machine's local zone. `--apply`
-on `rollover` writes a new file and refuses to overwrite an existing month unless
+`--timezone` to date undated entries outside the machine's local zone. `config`
+takes three whole percentages that add up to 100 and writes them into the sheet's
+budget heading; it needs `--apply` like every other command. `--apply` on
+`rollover` writes a new file and refuses to overwrite an existing month unless
 `--force` is given.
 
 ## Workflow
+
+Before the first entry on a ledger, confirm it has a split (see *First run*). If
+it does not, ask for the percentages and run `config` first.
 
 1. Parse each request as `AMOUNT DESCRIPTION`. Several lines in one message are
    one batch (`--entry` per line, one command). Collapse a byte-for-byte repeated
@@ -189,5 +226,11 @@ on `rollover` writes a new file and refuses to overwrite an existing month unles
 - **Escape replacement strings correctly.** When a file rewrite is built with
   format strings plus a regex substitution, a group reference needs one level of
   escaping; verify with a dry run on a copy first.
+- **Never assume 50/30/20.** A sheet with no split configured refuses to log
+  anything; that is the design, not a bug. Ask the user for their percentages and
+  run `config` instead of inventing a split for them.
+- **The budget heading is the split.** `60/25/15` on the sheet's heading line is
+  the configuration, so change it with `config` rather than editing it by hand,
+  and expect the maximums and remaining figures to move when it changes.
 - **A sheet with no income yet is normal** (a fresh month): entries are accepted,
   the maximums sit at zero, and remaining goes negative until income lands.

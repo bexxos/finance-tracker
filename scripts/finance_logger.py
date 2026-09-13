@@ -3,8 +3,15 @@
 
 The ledger is a single plain Markdown file that the user owns.  This module
 parses it, classifies each new expense as a Need or a Want, dates it in the
-user's local timezone, keeps the 50/30/20 budget view and the monthly rollover
-consistent, and always renders the COMPLETE updated sheet.
+user's local timezone, keeps the budget view built from the user's own
+Needs/Wants/Savings split and the monthly rollover consistent, and always
+renders the COMPLETE updated sheet.
+
+The split is not built in.  The sheet's budget heading *is* the split, written as
+``60/25/15``, and a sheet that has never been configured carries the
+``Needs/Wants/Savings`` placeholder instead.  Any command that needs a budget
+maximum refuses to run until the user's own percentages are set with ``config``,
+so nothing silently assumes somebody else's 50/30/20.
 
 Storage is an edge concern:
 
@@ -30,7 +37,7 @@ Sheet shape (see ``templates/blank-finance-sheet.txt``)::
     MM/DD/YY - <amount>
     Total: <sum>
 
-    50/30/20
+    <needs>/<wants>/<savings>  # the user's split; unconfigured until `config`
     Needs - <max> Max
     Wants - <max> Max
 
@@ -177,7 +184,6 @@ NEED_KEYWORDS = (
 TITLE_SUFFIX = "Expenses Log"
 LOANS_SECTION = "Loans:"
 IN_SECTION = "In:"
-BUDGET_SECTION = "50/30/20"
 SAVINGS_SECTION = "Savings:"
 CASH_SECTION = "Cash Reconciliation:"
 PENDING_SECTION = "Pending / Not Posted:"
@@ -194,11 +200,15 @@ CONFIRMED_EXPENSES_PREFIX = "Confirmed posted expenses: "
 CASH_FUNDED_PREFIX = "Cash-funded debt payments: "
 CONFIRMED_CASH_PREFIX = "Confirmed cash remaining: "
 
+# The budget heading is not a fixed string: it *is* the user's own split, written
+# as NN/NN/NN.  A sheet nobody has configured yet carries this placeholder
+# instead, which is deliberately not a split, so no default is ever assumed.
+BUDGET_PLACEHOLDER = "Needs/Wants/Savings"
+
 _MAJOR_HEADINGS = frozenset(
     {
         LOANS_SECTION,
         IN_SECTION,
-        BUDGET_SECTION,
         SAVINGS_SECTION,
         CASH_SECTION,
         PENDING_SECTION,
@@ -206,13 +216,17 @@ _MAJOR_HEADINGS = frozenset(
     }
 )
 
-# 50 / 30 / 20 of income, applied per income chunk.
-BUDGET_SPLIT = (Decimal("0.5"), Decimal("0.3"), Decimal("0.2"))
+# The command that sets a split, quoted in the refusal messages.
+CONFIG_EXAMPLE = (
+    "python3 scripts/finance_logger.py config "
+    "--needs 60 --wants 25 --savings 15 --apply"
+)
 
 # --------------------------------------------------------------------------- #
 # Lexical patterns
 # --------------------------------------------------------------------------- #
 _AMOUNT_RE = re.compile(r"^\s*[₱$Pp]?\s*([\d,]+(?:\.\d+)?)\s+(.+?)\s*$")
+_SPLIT_LABEL_RE = re.compile(r"^(\d{1,3})/(\d{1,3})/(\d{1,3})$")
 _INCOME_RE = re.compile(r"^\s*(\d{2})/(\d{2})/(\d{2})\s+-\s+([\d,]+)\s*$")
 _EXPENSE_RE = re.compile(r"^\s*\[(Need|Needs|Want|Wants)\]\s+([\d,]+)\s+(.+?)\s*$")
 _DATE_HEADING_RE = re.compile(r"^([A-Za-z]+) (\d{1,2})$")
@@ -236,6 +250,10 @@ class LedgerFormatError(LedgerError):
 
 class DuplicateEntryError(LedgerError):
     """An exact same-date entry already exists or is repeated in a batch."""
+
+
+class BudgetNotConfiguredError(LedgerError):
+    """The sheet has no Needs/Wants/Savings split yet, so no maximum exists."""
 
 
 class ConcurrentModificationError(LedgerError):
@@ -288,6 +306,56 @@ class IncomeEntry:
     @property
     def identity_key(self) -> tuple[str, int]:
         return self.date.isoformat(), self.amount
+
+
+@dataclass(frozen=True)
+class BudgetSplit:
+    """The user's own Needs/Wants/Savings percentages.
+
+    Whole numbers from 0 to 100 that add up to exactly 100.  They live in the
+    sheet's budget heading, so the file explains itself and no sidecar state can
+    drift away from what the sheet displays.
+    """
+
+    needs: int
+    wants: int
+    savings: int
+
+    def __post_init__(self) -> None:
+        for name in ("needs", "wants", "savings"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(
+                    f"the {name} percentage must be a whole number between 0 and 100"
+                )
+            if not 0 <= value <= 100:
+                raise ValueError(
+                    f"the {name} percentage must be between 0 and 100 (got {value})"
+                )
+        total = self.needs + self.wants + self.savings
+        if total != 100:
+            raise ValueError(
+                "the Needs/Wants/Savings percentages must add up to exactly 100 "
+                f"(got {self.needs} + {self.wants} + {self.savings} = {total}); "
+                f"for example: {CONFIG_EXAMPLE}"
+            )
+
+    @property
+    def label(self) -> str:
+        """The budget heading that carries this split, for example ``60/25/15``."""
+        return f"{self.needs}/{self.wants}/{self.savings}"
+
+    def maxima(self, income_total: int) -> tuple[int, int, int]:
+        """Whole-unit (needs, wants, savings) maximums for a total income.
+
+        Each part rounds half-to-even on its own, so the three parts can differ
+        from the income total by a unit.
+        """
+        return (
+            _round_units(Decimal(income_total) * self.needs / 100),
+            _round_units(Decimal(income_total) * self.wants / 100),
+            _round_units(Decimal(income_total) * self.savings / 100),
+        )
 
 
 @dataclass(frozen=True)
@@ -426,8 +494,64 @@ def _unique_index(lines: Sequence[str], value: str) -> int:
     return matches[0]
 
 
+def _is_budget_heading(line: str) -> bool:
+    """True for the budget heading: the sheet's split, or the placeholder."""
+    return line == BUDGET_PLACEHOLDER or _SPLIT_LABEL_RE.fullmatch(line) is not None
+
+
+def _is_major_heading(line: str) -> bool:
+    return line in _MAJOR_HEADINGS or _is_budget_heading(line)
+
+
 def _major_heading_indices(lines: Sequence[str]) -> list[int]:
-    return [index for index, line in enumerate(lines) if line in _MAJOR_HEADINGS]
+    return [index for index, line in enumerate(lines) if _is_major_heading(line)]
+
+
+def _budget_heading_index(lines: Sequence[str]) -> int:
+    """Return the index of the sheet's single budget heading line."""
+    matches = [index for index, line in enumerate(lines) if _is_budget_heading(line)]
+    if len(matches) != 1:
+        raise LedgerFormatError(
+            "expected exactly one budget heading line (a split like '60/25/15', or "
+            f"the {BUDGET_PLACEHOLDER!r} placeholder), found {len(matches)}"
+        )
+    return matches[0]
+
+
+def parse_split_label(label: str) -> BudgetSplit | None:
+    """Return the split a budget heading encodes, or None for the placeholder."""
+    match = _SPLIT_LABEL_RE.fullmatch(label)
+    if match is None:
+        return None
+    try:
+        return BudgetSplit(
+            needs=int(match.group(1)),
+            wants=int(match.group(2)),
+            savings=int(match.group(3)),
+        )
+    except ValueError as exc:
+        raise LedgerFormatError(
+            f"the budget heading {label!r} is not a usable split: {exc}"
+        ) from exc
+
+
+def read_budget_split(lines: Sequence[str]) -> BudgetSplit | None:
+    """Return the sheet's configured split, or None when it has none yet."""
+    return parse_split_label(lines[_budget_heading_index(lines)])
+
+
+def require_budget_split(
+    lines: Sequence[str], *, where: str = "this ledger"
+) -> BudgetSplit:
+    """Return the sheet's split, refusing when the user has not set one."""
+    split = read_budget_split(lines)
+    if split is None:
+        raise BudgetNotConfiguredError(
+            f"{where} has no Needs/Wants/Savings split yet, so no budget maximum "
+            "can be computed.  Run the config command first, for example: "
+            f"{CONFIG_EXAMPLE}"
+        )
+    return split
 
 
 def _section_end(lines: Sequence[str], start: int) -> int:
@@ -694,6 +818,10 @@ def _insert_entries(lines: list[str], entries: Sequence[Entry], month: str) -> N
 # --------------------------------------------------------------------------- #
 def _recalculate_and_replace(lines: list[str], month: str) -> LedgerSummary:
     """Rewrite every derived number in place and return the summary."""
+    # Fail closed before touching anything: without the user's own split there is
+    # no budget maximum, and inventing one would be somebody else's budget.
+    split = require_budget_split(lines)
+
     in_start = _unique_index(lines, IN_SECTION)
     in_end = _section_end(lines, in_start)
     income_lines = [
@@ -720,11 +848,9 @@ def _recalculate_and_replace(lines: list[str], month: str) -> LedgerSummary:
         and "(from savings)" not in normalize_description(entry.description)
     )
 
-    needs_max = _round_units(Decimal(income_total) * BUDGET_SPLIT[0])
-    wants_max = _round_units(Decimal(income_total) * BUDGET_SPLIT[1])
-    savings_max = _round_units(Decimal(income_total) * BUDGET_SPLIT[2])
+    needs_max, wants_max, savings_max = split.maxima(income_total)
 
-    budget_start = _unique_index(lines, BUDGET_SECTION)
+    budget_start = _budget_heading_index(lines)
     budget_end = _section_end(lines, budget_start)
     _set_prefixed(
         lines, budget_start, budget_end, NEEDS_PREFIX, needs_max, keep_max_suffix=True
@@ -1068,8 +1194,12 @@ def pay_loan(
     )
 
 
-def build_blank_sheet(month: str, year: int) -> str:
-    """Return a complete, all-zero sheet for a month, ready for its first income."""
+def build_blank_sheet(month: str, year: int, split: BudgetSplit | None = None) -> str:
+    """Return a complete, all-zero sheet for a month, ready for its first income.
+
+    Without a ``split`` the budget heading is the unconfigured placeholder, so a
+    new sheet never silently inherits somebody else's percentages.
+    """
     number = month_number(month)
     canonical = month_name(number)
     days = calendar.monthrange(year, number)[1]
@@ -1082,7 +1212,7 @@ def build_blank_sheet(month: str, year: int) -> str:
         IN_SECTION,
         f"{TOTAL_PREFIX}0",
         "",
-        BUDGET_SECTION,
+        split.label if split is not None else BUDGET_PLACEHOLDER,
         f"{NEEDS_PREFIX}0 Max",
         f"{WANTS_PREFIX}0 Max",
         "",
@@ -1117,9 +1247,10 @@ def plan_rollover(
 
     Current-month expenses, savings deposits, borrowed amounts and budget
     deductions are deliberately reset: a rollover opens a new month rather than
-    resetting the old one.  ``year`` defaults to the source sheet's year, plus
-    one when the target month comes earlier in the calendar than the source
-    month.
+    resetting the old one.  The user's own split is the exception: it carries
+    forward, because it is a preference rather than a monthly figure.  ``year``
+    defaults to the source sheet's year, plus one when the target month comes
+    earlier in the calendar than the source month.
     """
     if opening_income <= 0:
         raise ValueError("opening income must be positive")
@@ -1130,6 +1261,7 @@ def plan_rollover(
             "the source does not look like a ledger sheet (no '<Month> ...' title "
             "or date heading was found)"
         )
+    split = require_budget_split(source_lines, where="the source ledger")
     if year is None:
         source_year = sheet_year(source_lines)
         target_number = month_number(to_month)
@@ -1139,7 +1271,7 @@ def plan_rollover(
             year = source_year
 
     target_month = canonical_month(to_month)
-    lines, newline = _split_text(build_blank_sheet(target_month, year))
+    lines, newline = _split_text(build_blank_sheet(target_month, year, split))
 
     carried, _total = _parse_loans(source_lines)
     if carried:
@@ -1164,13 +1296,40 @@ def recompute(text: str, *, month: str | None = None) -> str:
     """Return the sheet with every derived number rewritten, changing nothing else.
 
     Useful as a self-check: on a consistent sheet the result is byte-identical to
-    the input, which is how the example ledgers in this repo are validated.
+    the input, which is how the example ledgers in this repo are validated.  The
+    sheet must carry a configured split, because every maximum depends on it.
     """
     lines, newline = _split_text(text)
     trailing_newline = text.endswith(("\n", "\r"))
     resolved = _resolve_month(lines, month, set())
     _recalculate_and_replace(lines, resolved)
     return _join_lines(lines, newline, trailing_newline)
+
+
+def configure_split(
+    text: str, split: BudgetSplit, *, month: str | None = None
+) -> LedgerPlan:
+    """Write the user's own split onto the sheet, then recompute from it.
+
+    The budget heading *is* the split, so the sheet stays self-contained and no
+    state can drift away from what the file displays.  Entries already on the
+    sheet keep the Need/Want label they were logged with; only the budget
+    maximums and the remaining figures move.
+    """
+    lines, newline = _split_text(text)
+    trailing_newline = text.endswith(("\n", "\r"))
+    heading = _budget_heading_index(lines)
+    note = ""
+    if lines[heading] == split.label:
+        note = (
+            f"the budget split was already {split.label}; "
+            "the maximums were recomputed"
+        )
+    lines[heading] = split.label
+    resolved = _resolve_month(lines, month, set())
+    summary = _recalculate_and_replace(lines, resolved)
+    projected = _join_lines(lines, newline, trailing_newline)
+    return LedgerPlan(projected, summary, (), (), note)
 
 
 # --------------------------------------------------------------------------- #
@@ -1384,6 +1543,24 @@ def _parse_cli_date(value: str, timezone_name: str | None) -> date:
         raise ValueError("--date must be 'today' or YYYY-MM-DD") from exc
 
 
+def _whole_percent(flag: str) -> Callable[[str], int]:
+    """Build an argparse type for one split percentage.
+
+    A non-integer must fail with a message that says what to fix, rather than
+    argparse's bare "invalid int value".
+    """
+
+    def parse(value: str) -> int:
+        try:
+            return int(value.strip())
+        except (AttributeError, ValueError):
+            raise argparse.ArgumentTypeError(
+                f"{flag} must be a whole number between 0 and 100 (got {value!r})"
+            ) from None
+
+    return parse
+
+
 def _common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--ledger",
@@ -1412,6 +1589,51 @@ def _build_cli() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    config = subparsers.add_parser(
+        "config",
+        help="set the Needs/Wants/Savings split this ledger uses",
+        description=(
+            "Set the ledger's own Needs/Wants/Savings split, in whole percentages "
+            "that add up to exactly 100.  Needs are the essentials the month "
+            "cannot avoid (rent, food, transport, bills, medicine); Wants are "
+            "discretionary (takeout, subscriptions, treats, games); Savings is "
+            "what is set aside.  The split is stored in the sheet's budget heading "
+            "(for example '60/25/15'), and every budget maximum and remaining "
+            "figure is recomputed from it.  Entries already on the sheet keep the "
+            "Need/Want label they were logged with.  Without --apply nothing is "
+            "written."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    config.add_argument(
+        "--ledger",
+        default=None,
+        help="ledger Markdown file (default: $FINANCE_LEDGER_PATH or ./finance-ledger.md)",
+    )
+    config.add_argument(
+        "--needs",
+        required=True,
+        type=_whole_percent("--needs"),
+        help="percentage of income for Needs: rent, food, transport, bills, medicine",
+    )
+    config.add_argument(
+        "--wants",
+        required=True,
+        type=_whole_percent("--wants"),
+        help="percentage of income for Wants: takeout, subscriptions, treats, games",
+    )
+    config.add_argument(
+        "--savings",
+        required=True,
+        type=_whole_percent("--savings"),
+        help="percentage of income set aside as Savings",
+    )
+    config.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the change; without it the command only prints the projection",
+    )
 
     add = subparsers.add_parser("add", help="log expenses and/or income")
     _common_arguments(add)
@@ -1484,6 +1706,12 @@ def _print(text: str) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_cli()
     args = parser.parse_args(argv)
+
+    # Validate a requested split before touching any file: a bad split is a usage
+    # error, not a ledger problem.
+    split = None
+    if args.command == "config":
+        split = BudgetSplit(needs=args.needs, wants=args.wants, savings=args.savings)
 
     if args.command == "rollover":
         ledger_path = _resolve_ledger_argument(args.ledger)
@@ -1566,6 +1794,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             plan = set_loan_balance(
                 baseline_text, args.name, int(args.balance), month=args.month
             )
+        elif args.command == "config":
+            collapsed = 0
+            assert split is not None  # built above, before the ledger was read
+            plan = configure_split(baseline_text, split)
         else:  # pragma: no cover - argparse rejects unknown commands
             parser.error("unknown command")
 
@@ -1587,7 +1819,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
-    "BUDGET_SPLIT",
+    "BUDGET_PLACEHOLDER",
+    "BudgetNotConfiguredError",
+    "BudgetSplit",
     "ConcurrentModificationError",
     "DuplicateEntryError",
     "Entry",
@@ -1602,6 +1836,7 @@ __all__ = [
     "canonical_month",
     "classify_description",
     "collapse_batch_duplicates",
+    "configure_split",
     "default_ledger_path",
     "format_plan",
     "format_summary",
@@ -1615,10 +1850,13 @@ __all__ = [
     "normalize_description",
     "parse_entry",
     "parse_income",
+    "parse_split_label",
     "pay_loan",
     "plan_rollover",
     "plan_update",
+    "read_budget_split",
     "recompute",
+    "require_budget_split",
     "set_loan_balance",
     "sheet_month",
     "sheet_year",

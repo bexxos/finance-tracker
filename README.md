@@ -2,8 +2,8 @@
 
 A deterministic personal-finance ledger in a single Markdown file. Log an expense
 or an income line in chat and the tool classifies it as a Need or a Want, dates it
-in your local timezone, keeps a 50/30/20 budget view in step, and prints the
-**complete** updated sheet. The repo root *is* the agent skill: `SKILL.md` teaches
+in your local timezone, keeps a budget view built from your own Needs/Wants/Savings
+split in step, and prints the **complete** updated sheet. The repo root *is* the agent skill: `SKILL.md` teaches
 the agent, `scripts/` does the work, and the default storage backend is a plain
 file on your machine — no account, no credentials, no network, standard library
 only.
@@ -31,18 +31,47 @@ with their own skill format — Claude Code, Cursor rules, and others — will u
 need only the frontmatter adapted; the instructions in the body, the scripts, the
 tests and the examples are plain files with no framework dependency.
 
+## First run
+
+There is no default split. Decide the percentages that match your own budget and
+write them into the sheet before the first entry:
+
+```bash
+python3 scripts/finance_logger.py config --ledger ledger.md \
+  --needs 60 --wants 25 --savings 15           # dry run: prints the whole sheet
+python3 scripts/finance_logger.py config --ledger ledger.md \
+  --needs 60 --wants 25 --savings 15 --apply   # writes it
+```
+
+Needs are the essentials the month cannot avoid (rent, food, transport, bills,
+medicine); Wants are discretionary (takeout, subscriptions, treats, games);
+Savings is what is set aside. The three values are whole numbers from 0 to 100
+that must add up to exactly 100.
+
+The split is stored in the sheet's own budget heading (`60/25/15`), so the file
+stays self-contained and nothing can drift away from what it displays. A sheet
+whose heading is already a split (the fictional sample ledger still carries
+`50/30/20`) keeps working exactly as it is. Every budget maximum and remaining
+figure is computed from it, and any command that needs a maximum refuses to run
+until a split exists, rather than assuming 50/30/20. Run `config` again to change
+it: the maximums are recomputed, and entries already logged keep the Need/Want
+label they were given.
+
 ## Try it
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'   # test suite, no network or credentials
-python3 examples/demo.py                               # logs entries, then rolls the month over
+python3 examples/demo.py                               # unconfigured run, then config, entries, rollover
 ```
 
 The demo copies the fictional `examples/sample-ledger.md` into a temporary
-directory, logs one Need, one Want and one income entry through the real CLI,
-prints the complete resulting sheet, rolls the sheet over to a new month with the
-loan balances carried forward, and prints that sheet too. It writes only inside a
-temporary directory that is deleted on exit.
+directory with its budget heading reset to the placeholder a brand-new sheet
+carries. It shows the refusal of an entry before any split is configured, sets a
+non-default split with `config`, logs one Need, one Want and one income entry
+through the real CLI, prints the complete resulting sheet, then rolls the sheet
+over to a new month with the split and the loan balances carried forward and
+prints that sheet too. It writes only inside a temporary directory that is
+deleted on exit.
 
 ## Use it
 
@@ -51,6 +80,9 @@ The ledger path comes from `--ledger`, else `$FINANCE_LEDGER_PATH`, else
 sheet; `--apply` is the only switch that writes.
 
 ```bash
+# Set your own split once; every budget maximum is computed from it.
+python3 scripts/finance_logger.py config --needs 60 --wants 25 --savings 15 --apply
+
 # Log a batch (repeat --entry). The date defaults to today in your local timezone.
 python3 scripts/finance_logger.py add --entry '42 groceries' \
   --entry '85 streaming subscription' --date 2026-09-12 --apply
@@ -84,7 +116,7 @@ SKILL.md                       agent-facing instructions (install target)
 README.md                      this file
 scripts/finance_logger.py      core planner + default local-file backend
 scripts/drive_adapter.py       OPT-IN cloud backend (your own credentials)
-tests/test_finance_logger.py   78 standard-library tests, offline
+tests/test_finance_logger.py   111 standard-library tests, offline
 references/*.md                format, workflow, classification, dates,
                                duplicates/concurrency, debt
 templates/blank-finance-sheet.txt
@@ -117,6 +149,8 @@ examples/demo.py               runnable end-to-end demo
 - **No automatic categorisation beyond its keyword rules.** A purchase for someone
   else, a medically needed item or a reclassification is not detectable from the
   text — override it per batch with `--kind`.
+- **No assumed budget split.** Nothing is logged against percentages you never
+  chose: the split is required before the first entry, and it is yours.
 - **No cloud sync by default**, and no telemetry: without the opt-in adapter this
   tool performs no network calls at all.
 - **No forecasting, multi-currency conversion, investing or tax features.** It is

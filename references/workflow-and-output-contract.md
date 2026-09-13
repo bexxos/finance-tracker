@@ -13,6 +13,11 @@ summary or for a specific number.
 
 ## One batch
 
+Before the first entry on a ledger, confirm it has a split (the skill's *First
+run* section). If it does not, ask the user for their Needs/Wants/Savings
+percentages and run `config`: the tool refuses every budget calculation until one
+is set, and inventing a split would put someone else's budget on their sheet.
+
 1. Turn the request into `AMOUNT DESCRIPTION` lines. Several entries in one
    message are one command with repeated flags, so the whole batch is planned
    against one baseline and cannot interleave with another writer.

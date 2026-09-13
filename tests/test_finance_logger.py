@@ -21,6 +21,9 @@ sys.path.insert(0, str(SCRIPTS))
 
 import finance_logger  # noqa: E402
 from finance_logger import (  # noqa: E402
+    BUDGET_PLACEHOLDER,
+    BudgetNotConfiguredError,
+    BudgetSplit,
     ConcurrentModificationError,
     DuplicateEntryError,
     Entry,
@@ -31,6 +34,7 @@ from finance_logger import (  # noqa: E402
     build_blank_sheet,
     classify_description,
     collapse_batch_duplicates,
+    configure_split,
     format_plan,
     lock_path_for,
     move_entries,
@@ -39,6 +43,7 @@ from finance_logger import (  # noqa: E402
     pay_loan,
     plan_rollover,
     plan_update,
+    read_budget_split,
     recompute,
     set_loan_balance,
     sheet_month,
@@ -230,7 +235,9 @@ class LedgerPlanningTests(unittest.TestCase):
             plan_update(BASELINE, [], incomes=[parse_income("10000", date(2026, 9, 1))])
 
     def test_a_sheet_with_no_income_yet_still_accepts_entries(self):
-        empty = build_blank_sheet("September", 2026)
+        empty = configure_split(
+            build_blank_sheet("September", 2026), BudgetSplit(60, 25, 15)
+        ).text
 
         plan = plan_update(empty, [parse_entry("40 fare", date(2026, 9, 4))])
 
@@ -447,6 +454,195 @@ class RolloverTests(unittest.TestCase):
         self.assertEqual(sheet_month(BASELINE.splitlines()), "September")
 
 
+class BudgetSplitTests(unittest.TestCase):
+    """The split is the user's own, and it is validated before it is used."""
+
+    def test_a_split_that_does_not_add_up_to_one_hundred_is_rejected(self):
+        for values in ((60, 25, 10), (50, 30, 30), (0, 0, 0), (34, 33, 34)):
+            with self.subTest(values=values), self.assertRaises(ValueError) as caught:
+                BudgetSplit(*values)
+
+            self.assertIn("add up to exactly 100", str(caught.exception))
+
+    def test_a_percentage_outside_zero_to_one_hundred_is_rejected(self):
+        for values in ((-1, 50, 51), (101, 0, -1), (0, 120, -20)):
+            with self.subTest(values=values), self.assertRaises(ValueError) as caught:
+                BudgetSplit(*values)
+
+            self.assertIn("between 0 and 100", str(caught.exception))
+
+    def test_a_percentage_that_is_not_a_whole_number_is_rejected(self):
+        for value in ("60", 60.5, None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                BudgetSplit(needs=value, wants=25, savings=15)
+
+    def test_the_label_is_the_split_written_onto_the_sheet(self):
+        self.assertEqual(BudgetSplit(60, 25, 15).label, "60/25/15")
+        self.assertEqual(BudgetSplit(100, 0, 0).label, "100/0/0")
+        self.assertEqual(BudgetSplit(5, 5, 90).label, "5/5/90")
+
+    def test_maximums_are_the_splits_share_of_income_rounded_half_to_even(self):
+        self.assertEqual(BudgetSplit(60, 25, 15).maxima(12000), (7200, 3000, 1800))
+        self.assertEqual(BudgetSplit(50, 30, 20).maxima(10000), (5000, 3000, 2000))
+        self.assertEqual(BudgetSplit(33, 33, 34).maxima(1000), (330, 330, 340))
+
+
+class ConfigureSplitTests(unittest.TestCase):
+    """`config` writes the user's split into the sheet and recomputes from it."""
+
+    def test_config_writes_the_users_split_into_the_sheet(self):
+        plan = configure_split(BASELINE, BudgetSplit(60, 25, 15))
+
+        self.assertIn("\n60/25/15\nNeeds - 6000 Max\nWants - 2500 Max\n", plan.text)
+        self.assertNotIn("50/30/20", plan.text)
+        self.assertEqual(plan.summary.needs_max, 6000)
+        self.assertEqual(plan.summary.wants_max, 2500)
+        self.assertEqual(plan.summary.savings_max, 1500)
+
+    def test_the_maximums_and_remainders_follow_the_configured_split(self):
+        plan = configure_split(BASELINE, BudgetSplit(60, 25, 15))
+
+        self.assertEqual(plan.summary.needs_remaining, 5528)
+        self.assertEqual(plan.summary.wants_remaining, 2401)
+        self.assertEqual(plan.summary.savings_remaining, 1500)
+        # The split redistributes the budget, it does not change what was spent.
+        self.assertEqual(plan.summary.remaining_total, 9429)
+        self.assertEqual(plan.summary.posted_expenses, 571)
+
+    def test_entries_keep_the_label_they_were_logged_with(self):
+        plan = configure_split(BASELINE, BudgetSplit(60, 25, 15))
+
+        before = [line for line in BASELINE.splitlines() if line.startswith("[")]
+        after = [line for line in plan.text.splitlines() if line.startswith("[")]
+        self.assertEqual(after, before)
+        self.assertIn("[Need] 350 rent", plan.text)
+        self.assertIn("[Wants] 99 mobile data", plan.text)
+
+    def test_any_split_label_is_accepted_on_read(self):
+        for label, split in (
+            ("70/20/10", BudgetSplit(70, 20, 10)),
+            ("5/5/90", BudgetSplit(5, 5, 90)),
+            ("100/0/0", BudgetSplit(100, 0, 0)),
+        ):
+            with self.subTest(label=label):
+                sheet = BASELINE.replace("50/30/20", label)
+                self.assertEqual(read_budget_split(sheet.splitlines()), split)
+
+    def test_a_hand_written_split_drives_the_maximums(self):
+        sheet = BASELINE.replace("50/30/20", "70/20/10")
+
+        plan = plan_update(sheet, [parse_entry("33 bread", date(2026, 9, 2))])
+
+        self.assertIn("\n70/20/10\nNeeds - 7000 Max\nWants - 2000 Max\n", plan.text)
+        self.assertEqual(plan.summary.needs_max, 7000)
+        self.assertEqual(plan.summary.wants_max, 2000)
+        self.assertEqual(plan.summary.savings_max, 1000)
+
+    def test_changing_the_split_again_recomputes_the_maximums(self):
+        changed = configure_split(BASELINE, BudgetSplit(60, 25, 15)).text
+
+        plan = configure_split(changed, BudgetSplit(45, 25, 30))
+
+        self.assertIn("\n45/25/30\nNeeds - 4500 Max\nWants - 2500 Max\n", plan.text)
+        self.assertEqual(plan.summary.savings_max, 3000)
+        self.assertEqual(plan.summary.savings_remaining, 3000)
+
+    def test_repeating_the_same_split_changes_nothing_and_says_so(self):
+        changed = configure_split(BASELINE, BudgetSplit(60, 25, 15)).text
+
+        again = configure_split(changed, BudgetSplit(60, 25, 15))
+
+        self.assertEqual(again.text, changed)
+        self.assertIn("already", again.note)
+
+    def test_setting_the_original_split_back_restores_the_sheet(self):
+        changed = configure_split(BASELINE, BudgetSplit(60, 25, 15)).text
+
+        restored = configure_split(changed, BudgetSplit(50, 30, 20))
+
+        self.assertEqual(restored.text, BASELINE)
+
+    def test_an_unusable_heading_is_reported_rather_than_read_as_a_default(self):
+        sheet = BASELINE.replace("50/30/20", "60/25/10")
+
+        with self.assertRaises(LedgerFormatError):
+            plan_update(sheet, [parse_entry("33 bread", date(2026, 9, 2))])
+
+    def test_config_can_repair_a_hand_edited_heading(self):
+        sheet = BASELINE.replace("50/30/20", "60/25/10")
+
+        plan = configure_split(sheet, BudgetSplit(60, 25, 15))
+
+        self.assertIn("\n60/25/15\nNeeds - 6000 Max\n", plan.text)
+        self.assertEqual(plan.summary.needs_max, 6000)
+
+    def test_a_sheet_with_no_budget_heading_at_all_is_rejected(self):
+        without = BASELINE.replace("50/30/20\n", "")
+
+        with self.assertRaises(LedgerFormatError):
+            configure_split(without, BudgetSplit(60, 25, 15))
+
+    def test_rollover_carries_the_users_split_into_the_new_month(self):
+        changed = configure_split(BASELINE, BudgetSplit(60, 25, 15)).text
+
+        plan = plan_rollover(changed, "October", 12000)
+
+        self.assertIn("\n60/25/15\nNeeds - 7200 Max\nWants - 3000 Max\n", plan.text)
+        self.assertEqual(plan.summary.needs_remaining, 7200)
+        self.assertEqual(plan.summary.wants_remaining, 3000)
+        self.assertEqual(plan.summary.savings_remaining, 1800)
+
+
+class UnconfiguredSplitTests(unittest.TestCase):
+    """Without a split, every budget calculation refuses instead of guessing."""
+
+    def unconfigured(self):
+        """A complete sheet whose split has never been set."""
+        return BASELINE.replace("50/30/20", BUDGET_PLACEHOLDER)
+
+    def test_the_placeholder_means_no_split_has_been_configured(self):
+        sheet = self.unconfigured()
+
+        self.assertIsNone(read_budget_split(sheet.splitlines()))
+        self.assertIn(BUDGET_PLACEHOLDER, sheet)
+
+    def test_add_refuses_and_names_the_config_command(self):
+        with self.assertRaises(BudgetNotConfiguredError) as caught:
+            plan_update(self.unconfigured(), [parse_entry("33 bread", date(2026, 9, 2))])
+
+        message = str(caught.exception)
+        self.assertIn("no Needs/Wants/Savings split", message)
+        self.assertIn("config --needs", message)
+
+    def test_rollover_move_and_the_loan_commands_refuse_too(self):
+        sheet = self.unconfigured()
+
+        with self.assertRaises(BudgetNotConfiguredError):
+            plan_rollover(sheet, "October", 12000)
+        with self.assertRaises(BudgetNotConfiguredError):
+            move_entries(
+                sheet,
+                [parse_entry("350 rent", date(2026, 9, 2))],
+                to_date=date(2026, 9, 8),
+            )
+        with self.assertRaises(BudgetNotConfiguredError):
+            set_loan_balance(sheet, "Loan B", 150)
+        with self.assertRaises(BudgetNotConfiguredError):
+            pay_loan(sheet, "Loan A", 200)
+
+    def test_recompute_refuses_because_there_is_no_maximum_to_check(self):
+        with self.assertRaises(BudgetNotConfiguredError):
+            recompute(self.unconfigured())
+
+    def test_a_refused_run_leaves_the_sheet_byte_identical(self):
+        sheet = self.unconfigured()
+
+        with self.assertRaises(BudgetNotConfiguredError):
+            plan_update(sheet, [parse_entry("33 bread", date(2026, 9, 2))])
+
+        self.assertEqual(sheet, self.unconfigured())
+
+
 class LocalStorageTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -630,6 +826,107 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.path.read_text(encoding="utf-8"), BASELINE)
 
 
+    def config_arguments(self, needs="60", wants="25", savings="15"):
+        return (
+            "config", "--ledger", str(self.path), "--needs", needs,
+            "--wants", wants, "--savings", savings,
+        )
+
+    def test_config_applies_the_users_split_and_returns_the_whole_sheet(self):
+        code, output = self.run_cli(*self.config_arguments(), "--apply")
+
+        self.assertEqual(code, 0)
+        self.assertIn("APPLIED", output)
+        self.assertIn("--- FULL SHEET ---", output)
+        text = self.path.read_text(encoding="utf-8")
+        self.assertIn("\n60/25/15\nNeeds - 6000 Max\nWants - 2500 Max\n", text)
+        self.assertNotIn("50/30/20", text)
+        self.assertFalse(lock_path_for(self.path).exists())
+
+    def test_config_without_apply_writes_nothing(self):
+        code, output = self.run_cli(*self.config_arguments())
+
+        self.assertEqual(code, 0)
+        self.assertIn("DRY RUN", output)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), BASELINE)
+
+    def test_a_split_that_does_not_add_up_to_one_hundred_is_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            self.run_cli(*self.config_arguments(savings="10"), "--apply")
+
+        self.assertIn("add up to exactly 100", str(caught.exception))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), BASELINE)
+
+    def test_an_out_of_range_percentage_is_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            self.run_cli(
+                "config", "--ledger", str(self.path), "--needs", "101",
+                "--wants", "0", "--savings", "-1", "--apply",
+            )
+
+        self.assertIn("between 0 and 100", str(caught.exception))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), BASELINE)
+
+    def test_a_non_integer_percentage_is_rejected_with_a_readable_message(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer), self.assertRaises(SystemExit):
+            finance_logger.main(
+                [
+                    "config", "--ledger", str(self.path), "--needs", "sixty",
+                    "--wants", "25", "--savings", "15", "--apply",
+                ]
+            )
+
+        self.assertIn("must be a whole number between 0 and 100", buffer.getvalue())
+        self.assertEqual(self.path.read_text(encoding="utf-8"), BASELINE)
+
+    def test_add_refuses_on_an_unconfigured_ledger_and_writes_nothing(self):
+        unconfigured = BASELINE.replace("50/30/20", BUDGET_PLACEHOLDER)
+        self.path.write_text(unconfigured, encoding="utf-8")
+
+        with self.assertRaises(BudgetNotConfiguredError) as caught:
+            self.run_cli(
+                "add", "--ledger", str(self.path), "--entry", "33 bread",
+                "--date", "2026-09-02", "--apply",
+            )
+
+        self.assertIn("config", str(caught.exception))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), unconfigured)
+
+    def test_rollover_refuses_on_an_unconfigured_ledger(self):
+        unconfigured = BASELINE.replace("50/30/20", BUDGET_PLACEHOLDER)
+        self.path.write_text(unconfigured, encoding="utf-8")
+
+        with self.assertRaises(BudgetNotConfiguredError):
+            self.run_cli(
+                "rollover", "--ledger", str(self.path), "--to-month", "October",
+                "--opening-income", "12000", "--apply",
+            )
+
+        self.assertFalse((self.path.parent / "october-expenses-log.md").exists())
+        self.assertEqual(self.path.read_text(encoding="utf-8"), unconfigured)
+
+    def test_the_first_run_sequence_config_then_add_then_rollover(self):
+        self.path.write_text(
+            BASELINE.replace("50/30/20", BUDGET_PLACEHOLDER), encoding="utf-8"
+        )
+
+        config_code, _ = self.run_cli(*self.config_arguments(), "--apply")
+        add_code, _ = self.run_cli(
+            "add", "--ledger", str(self.path), "--entry", "33 bread",
+            "--date", "2026-09-02", "--apply",
+        )
+        rollover_code, output = self.run_cli(
+            "rollover", "--ledger", str(self.path), "--to-month", "October",
+            "--opening-income", "12000", "--apply",
+        )
+
+        self.assertEqual((config_code, add_code, rollover_code), (0, 0, 0))
+        october = self.path.parent / "october-expenses-log.md"
+        self.assertIn("\n60/25/15\nNeeds - 7200 Max\n", october.read_text("utf-8"))
+        self.assertIn("[Need] 33 bread", self.path.read_text(encoding="utf-8"))
+
+
 class OfflineTests(unittest.TestCase):
     """The local path must keep working with the network switched off."""
 
@@ -771,22 +1068,35 @@ class PurityTests(unittest.TestCase):
 
 
 class ExampleAndTemplateTests(unittest.TestCase):
-    def test_the_blank_template_is_a_usable_january_sheet(self):
-        template = (ROOT / "templates" / "blank-finance-sheet.txt").read_text(
+    def read_template(self):
+        return (ROOT / "templates" / "blank-finance-sheet.txt").read_text(
             encoding="utf-8"
         )
 
+    def test_the_blank_template_is_a_usable_january_sheet(self):
+        template = self.read_template()
+
         self.assertEqual(sheet_month(template.splitlines()), "January")
-        plan = plan_update(template, [parse_entry("40 fare", date(2026, 1, 4))])
+        configured = configure_split(template, BudgetSplit(60, 25, 15)).text
+        plan = plan_update(configured, [parse_entry("40 fare", date(2026, 1, 4))])
 
         self.assertIn("January 4\n[Need] 40 fare", plan.text)
 
     def test_the_blank_template_is_already_consistent(self):
-        template = (ROOT / "templates" / "blank-finance-sheet.txt").read_text(
-            encoding="utf-8"
-        )
+        template = self.read_template()
+        configured = configure_split(template, BudgetSplit(60, 25, 15)).text
 
-        self.assertEqual(recompute(template), template)
+        self.assertEqual(recompute(configured), configured)
+
+    def test_the_blank_template_carries_no_split_until_the_user_sets_one(self):
+        template = self.read_template()
+
+        self.assertIsNone(read_budget_split(template.splitlines()))
+        with self.assertRaises(BudgetNotConfiguredError):
+            plan_update(template, [parse_entry("40 fare", date(2026, 1, 4))])
+
+    def test_the_blank_template_is_exactly_the_generated_blank_sheet(self):
+        self.assertEqual(build_blank_sheet("January", 2026), self.read_template())
 
     def test_the_sample_ledger_is_internally_consistent(self):
         sample = (ROOT / "examples" / "sample-ledger.md").read_text(encoding="utf-8")
@@ -833,6 +1143,15 @@ class SkillMetadataTests(unittest.TestCase):
 
         self.assertEqual(fields.get("name"), "finance-ledger")
         self.assertGreater(len(fields.get("description", "")), 40)
+
+    def test_the_skill_documents_the_mandatory_first_run_split_step(self):
+        text = self.read_skill()
+
+        self.assertIn("First run", text)
+        self.assertIn("ASK the user", text)
+        self.assertIn("--needs", text)
+        self.assertIn("Never assume 50/30/20", text)
+        self.assertIn("recomputed from the new percentages", text)
 
     def test_every_reference_file_is_linked_from_the_skill(self):
         text = self.read_skill()

@@ -37,7 +37,7 @@ A new month is a **new sheet**, not a new date section in the old one.
    forward double-counts them.
 4. Recompute the maximums and the remaining block from the new month's income.
    With one opening income and no expenses, remaining equals the income and the
-   savings bucket equals 20 % of it.
+   savings bucket equals the split's savings share of it.
 
 `rollover` performs all of that:
 
@@ -55,6 +55,9 @@ python3 scripts/finance_logger.py rollover --ledger september-ledger.md \
   for example) the year advances by one.
 - If the source file does not look like a ledger (no title month and no date
   headings), the command stops rather than producing an empty sheet.
+- The source's split carries into the new month, because the split is the user's
+  preference rather than a monthly figure. A source sheet with no split
+  configured stops the rollover: the new month would have no maximums.
 
 The previous month's file is left untouched. That is the point of the design: the
 sheet you roll over from stays the historical record.

@@ -12,6 +12,7 @@ turns a valid sheet into a rejected one.
 | Loans header | `Loans:` | Optional section. |
 | Loan balance | `<name> - <balance>` | Whole units. Any name without a colon. |
 | Income line | `MM/DD/YY - <amount>` | Two-digit month/day/year, spaced hyphen. |
+| Budget heading | `<needs>/<wants>/<savings>`, for example `60/25/15` | The sheet's own split. `Needs/Wants/Savings` means no split has been configured yet, and every command that needs a maximum refuses until `config` writes one. |
 | Section total | `Total: <amount>` | Appears under Loans, In, Savings and Remaining. |
 | Budget maximum | `Needs - <amount> Max` / `Wants - <amount> Max` | The word `Max` is preserved when present. |
 | Savings adjustments | `Borrowed: <n>` / `Used for loans: <n>` | Optional; both reduce savings remaining. |
@@ -23,9 +24,10 @@ turns a valid sheet into a rejected one.
 
 Everything below is recomputed from the sheet after any change:
 
-- `Needs - ` and `Wants - ` maxima: 50 % and 30 % of total income, and savings
-  maximum is the remaining 20 %. Amounts are whole units; the split rounds
-  half-to-even, so the three parts can differ from the income total by one unit.
+- `Needs - ` and `Wants - ` maxima, and the savings maximum: the sheet's own
+  split, read from its budget heading (for example `60/25/15`), applied to total
+  income. Amounts are whole units; each part rounds half-to-even on its own, so
+  the three parts can differ from the income total by one unit.
 - `Remaining` per bucket: its maximum minus the spend in that bucket.
 - `Remaining` savings: savings maximum minus `Total:`, `Borrowed:` and
   `Used for loans:`.
@@ -41,7 +43,9 @@ withdrawal-free balances are account state, and only `setloan`, `payloan` and
 ## Optional versus required
 
 Required anchors — a sheet missing any of these is rejected with a clear error:
-`In:`, `50/30/20`, `Savings:` with its `Total:`, `Remaining:` with `Needs - `,
+`In:`, the budget heading (a split such as `60/25/15`, or the
+`Needs/Wants/Savings` placeholder a sheet carries until `config` runs),
+`Savings:` with its `Total:`, `Remaining:` with `Needs - `,
 `Wants - `, `Savings - ` and `Total:`, the `In:` total line, and both budget
 maximum lines.
 
