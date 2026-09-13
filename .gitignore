@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local ledger data: never commit a real ledger, its lock or its event log
+ledger.md
+*-expenses-log.md
+*.lock
+*.events.json
+*.local.md
+finance-ledger.md
+
+# Local credentials for the opt-in cloud backend
+credentials.json
+token.json
+client_secret*.json
+.env
+.env.*
+
+# Runtime artifacts
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
