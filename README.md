@@ -13,7 +13,7 @@ only.
 Clone the repo into the skills directory your agent reads. For a Hermes profile:
 
 ```bash
-git clone <your-repo-url> ~/.hermes/skills/productivity/finance-ledger
+git clone https://github.com/bexxos/finance-tracker.git ~/.hermes/skills/productivity/finance-ledger
 ```
 
 Then start a new session: skills are scanned when a session loads, so a new chat
